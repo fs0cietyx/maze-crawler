@@ -303,9 +303,19 @@ class ActionDispatcher:
                 p = self.spatial.find_path(r.pos, f_pos)
                 if p: return p[0]
         if self.state.crystals:
-            closest = min(self.state.crystals.keys(), key=lambda c: self.spatial.manhattan_distance(r.pos, c))
-            p = self.spatial.find_path(r.pos, closest)
-            if p: return p[0]
+            # Score crystals based on energy / distance
+            best_crystal = None
+            max_score = -1.0
+            for c_pos, c_energy in self.state.crystals.items():
+                dist = self.spatial.manhattan_distance(r.pos, c_pos)
+                score = c_energy / (dist + 1)
+                if score > max_score:
+                    max_score = score
+                    best_crystal = c_pos
+            
+            if best_crystal:
+                p = self.spatial.find_path(r.pos, best_crystal)
+                if p: return p[0]
         return ACTION_NORTH
 
     def _decide_worker(self, r: RobotData, f_pos: Optional[Coord]) -> str:
