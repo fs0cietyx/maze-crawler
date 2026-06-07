@@ -77,6 +77,7 @@ class GameState:
         self.mines: Dict[Coord, List[int]] = {}
         self.crystals: Dict[Coord, int] = {}
         self.mining_nodes: Set[Coord] = set()
+        self.persistent_mining_nodes: Set[Coord] = set()
         self.my_robots: Dict[RobotUID, RobotData] = {}
         self.enemy_robots: Dict[RobotUID, RobotData] = {}
         self.step: int = 0
@@ -112,6 +113,7 @@ class GameState:
         for pos_str, _ in obs.miningNodes.items():
             c, r = map(int, pos_str.split(','))
             self.mining_nodes.add((c, r))
+            self.persistent_mining_nodes.add((c, r))
 
         for pos_str, data in obs.mines.items():
             c, r = map(int, pos_str.split(','))
@@ -313,8 +315,12 @@ class ActionDispatcher:
     def _decide_miner(self, r: RobotData) -> str:
         if r.pos in self.state.mining_nodes and r.energy >= self.state.config.transformCost:
             return "TRANSFORM"
-        if self.state.mining_nodes:
-            closest = min(self.state.mining_nodes, key=lambda n: self.spatial.manhattan_distance(r.pos, n))
+        
+        # Filter nodes that already have mines
+        available_nodes = [n for n in self.state.persistent_mining_nodes if n not in self.state.mines]
+        
+        if available_nodes:
+            closest = min(available_nodes, key=lambda n: self.spatial.manhattan_distance(r.pos, n))
             p = self.spatial.find_path(r.pos, closest)
             if p: return p[0]
         return ACTION_NORTH
