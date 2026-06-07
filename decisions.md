@@ -1,17 +1,19 @@
 # Decision Log - Maze Crawler
 
-## 2026-06-07
-### Use Python & `kaggle-environments`
-- **Decision:** Use the standard Python stack recommended by Kaggle.
-- **Rationale:** Native support, easy testing, and rich library ecosystem (NumPy, etc.).
-- **Revisit:** Not planned.
+## 2026-06-07 (Hyper-Optimization Strategy)
 
-### Survival First Strategy
-- **Decision:** Prioritize Factory movement and energy collection over aggressive combat.
-- **Rationale:** The competition is a 1v1 survival game where the "ground vanishes." Survival is the primary win condition.
-- **Revisit:** After achieving a stable top-tier survival rank on the leaderboard.
+### 1. Dynamic Weight A* (DWA*)
+- **Decision:** Apply an exponential penalty `max(0, 15 - dist_to_death) ** 2` to cell costs near the southern boundary.
+- **Rationale:** Linear penalties were insufficient to prevent Factory elimination during late-game scroll ramps. Exponential costs force the agent to prioritize northern movement above all else when risk is high.
 
-### Modular Agent Design
-- **Decision:** Structure the agent code into `ObservationProcessor`, `Pathfinder`, and `ActionGenerator`.
-- **Rationale:** Eases testing and allows swapping logic (e.g., different pathfinding algorithms).
-- **Revisit:** During the first major refactor.
+### 2. Predictive Destination Reservation
+- **Decision:** Finalize a turn-ahead simulation loop for all friendly coordinates.
+- **Rationale:** Absolute guarantee of zero friendly fire. By processing units in crush-hierarchy order, we ensure high-value units (Factories/Miners) never lose a turn to low-value unit path blocking.
+
+### 3. Latent Adversarial Evasion
+- **Decision:** Factory will prioritize lateral JUMPs (East/West) over northward movement when an enemy Factory is within 2 cells.
+- **Rationale:** Prevents mutual annihilation "Factory-crushes" that result in draws, preserving our Factory for a high-reward win.
+
+### 4. Asynchronous Energy Refueling
+- **Decision:** Robots will detour to the nearest mine or Factory when energy < 30, but only if they don't have a high-value crystal target.
+- **Rationale:** Balances resource acquisition with operational uptime.
