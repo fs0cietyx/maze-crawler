@@ -266,34 +266,44 @@ class ActionDispatcher:
         for ef in enemy_factories:
             dist = self.spatial.manhattan_distance(r.pos, ef.pos)
             if dist <= 2:
-                # Try to move away or jump
                 if r.jump_cd == 0:
-                    # Jump in opposite direction if safe
                     if ef.col > r.col: return "JUMP_WEST"
                     if ef.col < r.col: return "JUMP_EAST"
                     if ef.row > r.row: return "JUMP_SOUTH"
                     if ef.row < r.row: return "JUMP_NORTH"
-                return ACTION_NORTH # Default to pushing north to avoid boundary
+                return ACTION_NORTH
 
-        # 1. Escalating Survival Buffer based on ramp speed
-        buffer = 5 if self.state.step < 350 else 8
+        # 1. Survival: Dynamic Buffer (Escalates with Step Count)
+        # Boundary advances faster after step 100, ramps to 1 step/turn at 400.
+        base_buffer = 6
+        if self.state.step > 100: base_buffer = 8
+        if self.state.step > 250: base_buffer = 10
+        if self.state.step > 400: base_buffer = 12
 
-        if r.row < self.state.south_bound + buffer:
-            if r.jump_cd == 0 and (self.state.walls.get(r.pos, 0) & NORTH):
-                return "JUMP_NORTH"
+        if r.row < self.state.south_bound + base_buffer:
+            # If blocked or just need speed, JUMP north
+            if r.jump_cd == 0:
+                # Check if jumping north is safe (not off board)
+                if r.row + 2 <= self.state.north_bound:
+                    return "JUMP_NORTH"
             return ACTION_NORTH
-            
-        if r.build_cd == 0:
+
+        # 2. Production: Only build if we have a healthy energy surplus
+        if r.energy > 1200 and r.build_cd == 0:
             miners = sum(1 for rob in self.state.my_robots.values() if rob.rtype == TYPE_MINER)
             workers = sum(1 for rob in self.state.my_robots.values() if rob.rtype == TYPE_WORKER)
             scouts = sum(1 for rob in self.state.my_robots.values() if rob.rtype == TYPE_SCOUT)
-            
-            if r.energy >= self.state.config.minerCost and miners < 2: return "BUILD_MINER"
-            if r.energy >= self.state.config.workerCost and workers < 3: return "BUILD_WORKER"
-            if r.energy >= self.state.config.scoutCost and scouts < 5: return "BUILD_SCOUT"
-            
-        if self.state.step > 350 and r.move_cd == 0: return ACTION_NORTH
+
+            if r.energy >= self.state.config.minerCost and miners < 3: return "BUILD_MINER"
+            if r.energy >= self.state.config.workerCost and workers < 4: return "BUILD_WORKER"
+            if r.energy >= self.state.config.scoutCost and scouts < 6: return "BUILD_SCOUT"
+
+        # 3. Exploration: Move North slowly if we are safe
+        if self.state.step % 5 == 0 and r.move_cd == 0:
+            return ACTION_NORTH
+
         return ACTION_IDLE
+
 
     def _decide_scout(self, r: RobotData, f_pos: Optional[Coord]) -> str:
         tx = self._get_tx(r, f_pos)
