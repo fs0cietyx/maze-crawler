@@ -261,8 +261,23 @@ class ActionDispatcher:
         return None
 
     def _decide_factory(self, r: RobotData) -> str:
-        # Escalating Survival Buffer based on ramp speed
+        # 0. Defensive Maneuvering: Avoid enemy factories
+        enemy_factories = [e for e in self.state.enemy_robots.values() if e.rtype == TYPE_FACTORY]
+        for ef in enemy_factories:
+            dist = self.spatial.manhattan_distance(r.pos, ef.pos)
+            if dist <= 2:
+                # Try to move away or jump
+                if r.jump_cd == 0:
+                    # Jump in opposite direction if safe
+                    if ef.col > r.col: return "JUMP_WEST"
+                    if ef.col < r.col: return "JUMP_EAST"
+                    if ef.row > r.row: return "JUMP_SOUTH"
+                    if ef.row < r.row: return "JUMP_NORTH"
+                return ACTION_NORTH # Default to pushing north to avoid boundary
+
+        # 1. Escalating Survival Buffer based on ramp speed
         buffer = 5 if self.state.step < 350 else 8
+
         if r.row < self.state.south_bound + buffer:
             if r.jump_cd == 0 and (self.state.walls.get(r.pos, 0) & NORTH):
                 return "JUMP_NORTH"
