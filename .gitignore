@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Kaggle/Simulation Artifacts
+submission.tar.gz
+replay.json
+crawl-data/
+replays/
+logs/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+.obsidian/
