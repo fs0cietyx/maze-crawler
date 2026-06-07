@@ -160,18 +160,21 @@ class SpatialEngine:
         nodes_evaluated = 0
 
         while frontier:
-            if nodes_evaluated > max_nodes:
-                break # Compute Circuit Breaker
+            if nodes_evaluated > max_nodes: break 
             _, current = heapq.heappop(frontier)
             nodes_evaluated += 1
 
             if current == goal: break
 
             for next_pos, action in self.get_neighbors(current):
-                # Critical Survival: Never route below south bound
+                # Critical Survival: Never route below or at south bound
                 if next_pos[1] <= self.state.south_bound: continue
+                
+                # Penalty for being close to the "death zone"
+                boundary_penalty = 0
+                if next_pos[1] < self.state.south_bound + 4: boundary_penalty = 5
                     
-                new_cost = cost_so_far[current] + 1
+                new_cost = cost_so_far[current] + 1 + boundary_penalty
                 if next_pos not in cost_so_far or new_cost < cost_so_far[next_pos]:
                     cost_so_far[next_pos] = new_cost
                     priority = new_cost + self.manhattan_distance(goal, next_pos)
@@ -312,8 +315,9 @@ class ActionDispatcher:
             if f_pos:
                 p = self.spatial.find_path(r.pos, f_pos)
                 if p: return p[0]
+        
+        # 1. High Priority: Target crystals
         if self.state.crystals:
-            # Score crystals based on energy / distance
             best_crystal = None
             max_score = -1.0
             for c_pos, c_energy in self.state.crystals.items():
@@ -322,10 +326,15 @@ class ActionDispatcher:
                 if score > max_score:
                     max_score = score
                     best_crystal = c_pos
-            
             if best_crystal:
                 p = self.spatial.find_path(r.pos, best_crystal)
                 if p: return p[0]
+        
+        # 2. Discovery: Move towards the edge of the fog (NORTH)
+        target_discovery = (r.col, min(r.row + 5, self.state.north_bound))
+        p = self.spatial.find_path(r.pos, target_discovery)
+        if p: return p[0]
+        
         return ACTION_NORTH
 
     def _decide_worker(self, r: RobotData, f_pos: Optional[Coord]) -> str:
@@ -336,15 +345,31 @@ class ActionDispatcher:
         if f_pos and f_pos[1] < r.row and self.spatial.manhattan_distance(r.pos, f_pos) < 3:
             if (self.state.walls.get(r.pos, 0) & NORTH) and r.energy >= self.state.config.wallRemoveCost:
                 return "REMOVE_NORTH"
-                
+
+        # Offensive: Trap enemy factory if we have surplus energy
+        enemy_factories = [e for e in self.state.enemy_robots.values() if e.rtype == TYPE_FACTORY]
+        if enemy_factories and r.energy > 150:
+            ef = enemy_factories[0]
+            # Target a cell in front of the enemy factory
+            target_trap = (ef.col, ef.row + 1)
+            dist = self.spatial.manhattan_distance(r.pos, target_trap)
+            if dist == 0:
+                # Build walls around them
+                return "BUILD_NORTH"
+            if dist <= 5:
+                p = self.spatial.find_path(r.pos, target_trap)
+                if p: return p[0]
+
         if r.energy < 50 or r.energy >= 250:
             if f_pos:
                 p = self.spatial.find_path(r.pos, f_pos)
                 if p: return p[0]
+
         if self.state.crystals:
             closest = min(self.state.crystals.keys(), key=lambda c: self.spatial.manhattan_distance(r.pos, c))
             p = self.spatial.find_path(r.pos, closest)
             if p: return p[0]
+            
         return ACTION_NORTH
 
     def _decide_miner(self, r: RobotData) -> str:
