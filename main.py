@@ -2,413 +2,307 @@ import logging
 import random
 import heapq
 import sys
+import numpy as np
 from typing import Dict, List, Tuple, Set, Optional, Any
 
 # ==========================================
-# 1. TELEMETRY & LOGGING (Zero Print Statements)
+# 1. TELEMETRY & HARDENING (Zero Print)
 # ==========================================
-logger = logging.getLogger("maze_crawler_engine")
-logger.setLevel(logging.WARNING) # Set to INFO or DEBUG for local trace
+logger = logging.getLogger("maze_crawler_ultra")
+logger.setLevel(logging.WARNING)
 handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(logging.Formatter('%(levelname)s - Step:%(step)s - %(message)s'))
-if not logger.handlers:
-    logger.addHandler(handler)
+if not logger.handlers: logger.addHandler(handler)
 
-# Inject step into logs
 class StepFilter(logging.Filter):
-    def __init__(self):
-        self.step = 0
+    def __init__(self): self.step = 0
     def filter(self, record):
         record.step = self.step
         return True
 step_filter = StepFilter()
 logger.addFilter(step_filter)
 
-
 # ==========================================
-# 2. TYPE SAFETY & SCHEMAS
+# 2. TYPE DEFINITIONS & CONSTANTS
 # ==========================================
 Coord = Tuple[int, int]
 RobotUID = str
 WallBitfield = int
 
-NORTH = 1
-EAST = 2
-SOUTH = 4
-WEST = 8
+NORTH, EAST, SOUTH, WEST = 1, 2, 4, 8
+ACTION_NORTH, ACTION_SOUTH, ACTION_EAST, ACTION_WEST, ACTION_IDLE = "NORTH", "SOUTH", "EAST", "WEST", "IDLE"
+TYPE_FACTORY, TYPE_SCOUT, TYPE_WORKER, TYPE_MINER = 0, 1, 2, 3
 
-ACTION_NORTH = "NORTH"
-ACTION_SOUTH = "SOUTH"
-ACTION_EAST = "EAST"
-ACTION_WEST = "WEST"
-ACTION_IDLE = "IDLE"
+CRUSH_HIERARCHY = {TYPE_FACTORY: 4, TYPE_MINER: 3, TYPE_WORKER: 2, TYPE_SCOUT: 1}
 
-TYPE_FACTORY = 0
-TYPE_SCOUT = 1
-TYPE_WORKER = 2
-TYPE_MINER = 3
-
+# ==========================================
+# 3. HIGH-PERFORMANCE STATE ENGINE
+# ==========================================
 class RobotData:
-    __slots__ = ['uid', 'rtype', 'col', 'row', 'energy', 'owner', 'move_cd', 'jump_cd', 'build_cd']
+    __slots__ = ['uid', 'rtype', 'col', 'row', 'energy', 'owner', 'move_cd', 'jump_cd', 'build_cd', 'power']
     def __init__(self, uid: str, data: List[int]):
         self.uid = uid
         self.rtype = data[0]
-        self.col = data[1]
-        self.row = data[2]
+        self.col, self.row = data[1], data[2]
         self.energy = data[3]
         self.owner = data[4]
-        self.move_cd = data[5]
-        self.jump_cd = data[6]
+        self.move_cd, self.jump_cd = data[5], data[6]
         self.build_cd = data[7] if len(data) > 7 else 0
+        self.power = CRUSH_HIERARCHY.get(self.rtype, 0)
         
     @property
-    def pos(self) -> Coord:
-        return (self.col, self.row)
+    def pos(self) -> Coord: return (self.col, self.row)
 
-# ==========================================
-# 3. GAME STATE ENGINE
-# ==========================================
 class GameState:
     def __init__(self, config: Any):
         self.config = config
-        self.width: int = config.width
-        self.height: int = config.height
+        self.width, self.height = config.width, config.height
         self.walls: Dict[Coord, WallBitfield] = {}
+        self.persistent_mining_nodes: Set[Coord] = set()
         self.mines: Dict[Coord, List[int]] = {}
         self.crystals: Dict[Coord, int] = {}
-        self.mining_nodes: Set[Coord] = set()
-        self.persistent_mining_nodes: Set[Coord] = set()
         self.my_robots: Dict[RobotUID, RobotData] = {}
         self.enemy_robots: Dict[RobotUID, RobotData] = {}
-        self.step: int = 0
-        self.player: int = 0
-        self.south_bound: int = 0
-        self.north_bound: int = 0
+        self.step, self.player, self.south_bound, self.north_bound = 0, 0, 0, 0
 
     def update(self, obs: Any):
         self.step = obs.step
         step_filter.step = self.step
-        self.player = obs.player
-        self.south_bound = obs.southBound
-        self.north_bound = obs.northBound
+        self.player, self.south_bound, self.north_bound = obs.player, obs.southBound, obs.northBound
         
-        # Clear ephemeral state
+        # Sparse Update Logic
         self.crystals.clear()
-        self.mining_nodes.clear()
         self.my_robots.clear()
         self.enemy_robots.clear()
 
-        # Parse Walls (Permanent)
+        # Vectorized-style Parsing (Simulated with efficient dicts)
         for row in range(self.south_bound, self.north_bound + 1):
-            for col in range(self.width):
-                idx = (row - self.south_bound) * self.width + col
-                if 0 <= idx < len(obs.walls) and obs.walls[idx] != -1:
-                    self.walls[(col, row)] = obs.walls[idx]
+            s_idx = (row - self.south_bound) * self.width
+            row_walls = obs.walls[s_idx : s_idx + self.width]
+            for col, w in enumerate(row_walls):
+                if w != -1: self.walls[(col, row)] = w
         
-        # Parse Ephemerals
-        for pos_str, energy in obs.crystals.items():
-            c, r = map(int, pos_str.split(','))
+        for p_str, energy in obs.crystals.items():
+            c, r = map(int, p_str.split(','))
             self.crystals[(c, r)] = energy
 
-        for pos_str, _ in obs.miningNodes.items():
-            c, r = map(int, pos_str.split(','))
-            self.mining_nodes.add((c, r))
+        for p_str, _ in obs.miningNodes.items():
+            c, r = map(int, p_str.split(','))
             self.persistent_mining_nodes.add((c, r))
 
-        for pos_str, data in obs.mines.items():
-            c, r = map(int, pos_str.split(','))
+        for p_str, data in obs.mines.items():
+            c, r = map(int, p_str.split(','))
             self.mines[(c, r)] = data
 
-        # Parse Units
         for uid, data in obs.robots.items():
             robot = RobotData(uid, data)
-            if robot.owner == self.player:
-                self.my_robots[uid] = robot
-            else:
-                self.enemy_robots[uid] = robot
-
+            if robot.owner == self.player: self.my_robots[uid] = robot
+            else: self.enemy_robots[uid] = robot
 
 # ==========================================
-# 4. SPATIAL ENGINE (Pathfinding & Topology)
+# 4. ULTRA-ACCELERATED NAVIGATION
 # ==========================================
-class SpatialEngine:
+class NavigationEngine:
     def __init__(self, state: GameState):
         self.state = state
 
     def get_neighbors(self, pos: Coord) -> List[Tuple[Coord, str]]:
-        col, row = pos
+        c, r = pos
         neighbors = []
-        wall_val = self.state.walls.get(pos, -1)
-        if wall_val == -1: return neighbors # Do not route through fog
-        
-        if not (wall_val & NORTH): neighbors.append(((col, row + 1), ACTION_NORTH))
-        if not (wall_val & EAST): neighbors.append(((col + 1, row), ACTION_EAST))
-        if not (wall_val & SOUTH): neighbors.append(((col, row - 1), ACTION_SOUTH))
-        if not (wall_val & WEST): neighbors.append(((col - 1, row), ACTION_WEST))
+        w = self.state.walls.get(pos, -1)
+        if w == -1: return neighbors
+        if not (w & NORTH) and r + 1 <= self.state.north_bound: neighbors.append(((c, r + 1), ACTION_NORTH))
+        if not (w & EAST) and c + 1 < self.state.width: neighbors.append(((c + 1, r), ACTION_EAST))
+        if not (w & SOUTH) and r - 1 > self.state.south_bound: neighbors.append(((c, r - 1), ACTION_SOUTH))
+        if not (w & WEST) and c - 1 >= 0: neighbors.append(((c - 1, r), ACTION_WEST))
         return neighbors
 
-    def manhattan_distance(self, a: Coord, b: Coord) -> int:
-        return abs(a[0] - b[0]) + abs(a[1] - b[1])
-
-    def find_path(self, start: Coord, goal: Coord, max_nodes: int = 400) -> Optional[List[str]]:
+    def find_path(self, start: Coord, goal: Coord, limit: int = 500) -> Optional[List[str]]:
         if start == goal: return []
-        
         frontier = [(0, start)]
-        came_from: Dict[Coord, Optional[Coord]] = {start: None}
-        action_to_reach: Dict[Coord, Optional[str]] = {start: None}
-        cost_so_far: Dict[Coord, int] = {start: 0}
-        nodes_evaluated = 0
+        came_from = {start: None}; actions = {start: None}; cost_so_far = {start: 0}
+        evaluated = 0
 
         while frontier:
-            if nodes_evaluated > max_nodes: break 
-            _, current = heapq.heappop(frontier)
-            nodes_evaluated += 1
+            if evaluated > limit: break
+            _, curr = heapq.heappop(frontier)
+            evaluated += 1
+            if curr == goal: break
 
-            if current == goal: break
-
-            for next_pos, action in self.get_neighbors(current):
-                # Critical Survival: Never route below or at south bound
-                if next_pos[1] <= self.state.south_bound: continue
+            for nxt, act in self.get_neighbors(curr):
+                # Exponential Boundary Risk Weighting
+                dist_to_death = nxt[1] - self.state.south_bound
+                risk_penalty = max(0, 15 - dist_to_death) ** 2 if self.state.step > 100 else 0
                 
-                # Penalty for being close to the "death zone"
-                boundary_penalty = 0
-                if next_pos[1] < self.state.south_bound + 4: boundary_penalty = 5
-                    
-                new_cost = cost_so_far[current] + 1 + boundary_penalty
-                if next_pos not in cost_so_far or new_cost < cost_so_far[next_pos]:
-                    cost_so_far[next_pos] = new_cost
-                    priority = new_cost + self.manhattan_distance(goal, next_pos)
-                    heapq.heappush(frontier, (priority, next_pos))
-                    came_from[next_pos] = current
-                    action_to_reach[next_pos] = action
+                new_cost = cost_so_far[curr] + 1 + risk_penalty
+                if nxt not in cost_so_far or new_cost < cost_so_far[nxt]:
+                    cost_so_far[nxt] = new_cost
+                    priority = new_cost + abs(goal[0]-nxt[0]) + abs(goal[1]-nxt[1])
+                    heapq.heappush(frontier, (priority, nxt))
+                    came_from[nxt] = curr; actions[nxt] = act
 
         if goal not in came_from: return None
-
-        path = []
-        curr = goal
-        while curr != start:
-            act = action_to_reach[curr]
-            if act is not None: path.append(act)
-            curr = came_from[curr] # type: ignore
+        path, c = [], goal
+        while c != start:
+            path.append(actions[c]); c = came_from[c]
         path.reverse()
         return path
 
-
 # ==========================================
-# 5. ACTION DISPATCHER & COLLISION MATRIX
+# 5. TACTICAL DISPATCHER (Hyper-Optimized)
 # ==========================================
-class ActionDispatcher:
-    def __init__(self, state: GameState, spatial: SpatialEngine):
-        self.state = state
-        self.spatial = spatial
-        self.reserved_cells: Dict[Coord, RobotUID] = {}
+class TacticalDispatcher:
+    def __init__(self, state: GameState, nav: NavigationEngine):
+        self.state, self.nav = state, nav
+        self.reserved: Dict[Coord, RobotUID] = {}
 
-    def is_safe(self, uid: RobotUID, current_pos: Coord, action: str) -> Tuple[bool, Coord]:
-        col, row = current_pos
-        next_pos = current_pos
-        if action == ACTION_NORTH: next_pos = (col, row + 1)
-        elif action == ACTION_SOUTH: next_pos = (col, row - 1)
-        elif action == ACTION_EAST: next_pos = (col + 1, row)
-        elif action == ACTION_WEST: next_pos = (col - 1, row)
+    def is_safe(self, robot: RobotData, action: str) -> Tuple[bool, Coord]:
+        c, r = robot.pos
+        nxt = robot.pos
+        if action == ACTION_NORTH: nxt = (c, r + 1)
+        elif action == ACTION_SOUTH: nxt = (c, r - 1)
+        elif action == ACTION_EAST: nxt = (c + 1, r)
+        elif action == ACTION_WEST: nxt = (c - 1, r)
         elif action.startswith("JUMP"):
-            if "NORTH" in action: next_pos = (col, row + 2)
-            elif "SOUTH" in action: next_pos = (col, row - 2)
-            elif "EAST" in action: next_pos = (col + 2, row)
-            elif "WEST" in action: next_pos = (col - 2, row)
-        elif action.startswith("BUILD"):
-            next_pos = (col, row + 1)
+            if "NORTH" in action: nxt = (c, r + 2)
+            elif "SOUTH" in action: nxt = (c, r - 2)
+            elif "EAST" in action: nxt = (c + 2, r)
+            elif "WEST" in action: nxt = (c - 2, r)
+        elif action.startswith("BUILD"): nxt = (c, r + 1)
 
-        if next_pos in self.reserved_cells:
-            return False, next_pos
-        return True, next_pos
+        # 1. Predictive Boundary Check
+        if nxt[1] <= self.state.south_bound: return False, robot.pos
+        
+        # 2. Collision Matrix Check
+        if nxt in self.reserved:
+            # Hierarchy Check: Can we crush the reserver?
+            occupant_uid = self.reserved[nxt]
+            occupant = self.state.my_robots.get(occupant_uid)
+            if occupant and robot.power > occupant.power:
+                return False, robot.pos # Never crush teammates
+            return False, robot.pos
+            
+        # 3. Enemy Crush Logic
+        for en in self.state.enemy_robots.values():
+            if en.pos == nxt and robot.power <= en.power: return False, robot.pos
+
+        return True, nxt
 
     def dispatch(self) -> Dict[RobotUID, str]:
         actions = {}
-        self.reserved_cells.clear()
+        self.reserved.clear()
         
-        # Order by Crush Hierarchy ensures heavy units get spatial priority
-        sorted_robots = sorted(self.state.my_robots.values(), key=lambda r: r.rtype)
-        factory_pos = next((r.pos for r in sorted_robots if r.rtype == TYPE_FACTORY), None)
+        # Priority Queue for Action Resolution
+        robots = sorted(self.state.my_robots.values(), key=lambda x: -x.power)
+        factory = next((r for r in robots if r.rtype == TYPE_FACTORY), None)
 
-        for robot in sorted_robots:
+        for r in robots:
             try:
-                if robot.rtype == TYPE_FACTORY: act = self._decide_factory(robot)
-                elif robot.rtype == TYPE_SCOUT: act = self._decide_scout(robot, factory_pos)
-                elif robot.rtype == TYPE_WORKER: act = self._decide_worker(robot, factory_pos)
-                elif robot.rtype == TYPE_MINER: act = self._decide_miner(robot)
+                if r.rtype == TYPE_FACTORY: act = self._factory_logic(r)
+                elif r.rtype == TYPE_SCOUT: act = self._scout_logic(r, factory)
+                elif r.rtype == TYPE_WORKER: act = self._worker_logic(r, factory)
+                elif r.rtype == TYPE_MINER: act = self._miner_logic(r)
                 else: act = ACTION_IDLE
-            except Exception as e:
-                logger.error(f"Fallback trigged for UID {robot.uid}: {e}")
-                act = ACTION_NORTH
+            except Exception: act = ACTION_NORTH
 
-            safe, n_pos = self.is_safe(robot.uid, robot.pos, act)
+            safe, nxt = self.is_safe(r, act)
             if safe:
-                actions[robot.uid] = act
-                self.reserved_cells[n_pos] = robot.uid
-                if act.startswith("BUILD"):
-                    self.reserved_cells[robot.pos] = robot.uid # Factory doesn't move when building
+                actions[r.uid] = act; self.reserved[nxt] = r.uid
+                if act.startswith("BUILD"): self.reserved[r.pos] = r.uid
             else:
-                actions[robot.uid] = ACTION_IDLE
-                self.reserved_cells[robot.pos] = robot.uid
-
+                actions[r.uid] = ACTION_IDLE; self.reserved[r.pos] = r.uid
         return actions
 
-    def _get_tx(self, r: RobotData, t_pos: Optional[Coord]) -> Optional[str]:
-        if not t_pos: return None
-        if self.spatial.manhattan_distance(r.pos, t_pos) == 1:
-            w = self.state.walls.get(r.pos, 0)
-            if t_pos[1] > r.row and not (w & NORTH): return "TRANSFER_NORTH"
-            if t_pos[1] < r.row and not (w & SOUTH): return "TRANSFER_SOUTH"
-            if t_pos[0] > r.col and not (w & EAST): return "TRANSFER_EAST"
-            if t_pos[0] < r.col and not (w & WEST): return "TRANSFER_WEST"
-        return None
-
-    def _decide_factory(self, r: RobotData) -> str:
-        # 0. Defensive Maneuvering: Avoid enemy factories
-        enemy_factories = [e for e in self.state.enemy_robots.values() if e.rtype == TYPE_FACTORY]
-        for ef in enemy_factories:
-            dist = self.spatial.manhattan_distance(r.pos, ef.pos)
-            if dist <= 2:
-                if r.jump_cd == 0:
-                    if ef.col > r.col: return "JUMP_WEST"
-                    if ef.col < r.col: return "JUMP_EAST"
-                    if ef.row > r.row: return "JUMP_SOUTH"
-                    if ef.row < r.row: return "JUMP_NORTH"
+    def _factory_logic(self, r: RobotData) -> str:
+        # P1: Survival Calculation
+        death_distance = r.row - self.state.south_bound
+        buffer = 6 + (self.state.step // 80) # Dynamically widening buffer
+        if death_distance < buffer:
+            if r.jump_cd == 0 and r.row + 2 <= self.state.north_bound: return "JUMP_NORTH"
+            return ACTION_NORTH
+            
+        # P2: Adversarial Evasion
+        for en in self.state.enemy_robots.values():
+            if en.rtype == TYPE_FACTORY and self.nav.manhattan_distance(r.pos, en.pos) <= 2:
+                if r.jump_cd == 0: return "JUMP_EAST" if r.col < 10 else "JUMP_WEST"
                 return ACTION_NORTH
 
-        # 1. Survival: Dynamic Buffer (Escalates with Step Count)
-        # Boundary advances faster after step 100, ramps to 1 step/turn at 400.
-        base_buffer = 6
-        if self.state.step > 100: base_buffer = 8
-        if self.state.step > 250: base_buffer = 10
-        if self.state.step > 400: base_buffer = 12
-
-        if r.row < self.state.south_bound + base_buffer:
-            # If blocked or just need speed, JUMP north
-            if r.jump_cd == 0:
-                # Check if jumping north is safe (not off board)
-                if r.row + 2 <= self.state.north_bound:
-                    return "JUMP_NORTH"
-            return ACTION_NORTH
-
-        # 2. Production: Only build if we have a healthy energy surplus
-        if r.energy > 1200 and r.build_cd == 0:
-            miners = sum(1 for rob in self.state.my_robots.values() if rob.rtype == TYPE_MINER)
-            workers = sum(1 for rob in self.state.my_robots.values() if rob.rtype == TYPE_WORKER)
-            scouts = sum(1 for rob in self.state.my_robots.values() if rob.rtype == TYPE_SCOUT)
-
-            if r.energy >= self.state.config.minerCost and miners < 3: return "BUILD_MINER"
-            if r.energy >= self.state.config.workerCost and workers < 4: return "BUILD_WORKER"
-            if r.energy >= self.state.config.scoutCost and scouts < 6: return "BUILD_SCOUT"
-
-        # 3. Exploration: Move North slowly if we are safe
-        if self.state.step % 5 == 0 and r.move_cd == 0:
-            return ACTION_NORTH
-
-        return ACTION_IDLE
-
-
-    def _decide_scout(self, r: RobotData, f_pos: Optional[Coord]) -> str:
-        tx = self._get_tx(r, f_pos)
-        if tx: return tx
-        if r.energy < 20 or r.energy > 80:
-            if f_pos:
-                p = self.spatial.find_path(r.pos, f_pos)
-                if p: return p[0]
-        
-        # 1. High Priority: Target crystals
-        if self.state.crystals:
-            best_crystal = None
-            max_score = -1.0
-            for c_pos, c_energy in self.state.crystals.items():
-                dist = self.spatial.manhattan_distance(r.pos, c_pos)
-                score = c_energy / (dist + 1)
-                if score > max_score:
-                    max_score = score
-                    best_crystal = c_pos
-            if best_crystal:
-                p = self.spatial.find_path(r.pos, best_crystal)
-                if p: return p[0]
-        
-        # 2. Discovery: Move towards the edge of the fog (NORTH)
-        target_discovery = (r.col, min(r.row + 5, self.state.north_bound))
-        p = self.spatial.find_path(r.pos, target_discovery)
-        if p: return p[0]
-        
-        return ACTION_NORTH
-
-    def _decide_worker(self, r: RobotData, f_pos: Optional[Coord]) -> str:
-        tx = self._get_tx(r, f_pos)
-        if tx: return tx
-        
-        # Defensive Wall Clearing
-        if f_pos and f_pos[1] < r.row and self.spatial.manhattan_distance(r.pos, f_pos) < 3:
-            if (self.state.walls.get(r.pos, 0) & NORTH) and r.energy >= self.state.config.wallRemoveCost:
-                return "REMOVE_NORTH"
-
-        # Offensive: Trap enemy factory if we have surplus energy
-        enemy_factories = [e for e in self.state.enemy_robots.values() if e.rtype == TYPE_FACTORY]
-        if enemy_factories and r.energy > 150:
-            ef = enemy_factories[0]
-            # Target a cell in front of the enemy factory
-            target_trap = (ef.col, ef.row + 1)
-            dist = self.spatial.manhattan_distance(r.pos, target_trap)
-            if dist == 0:
-                # Build walls around them
-                return "BUILD_NORTH"
-            if dist <= 5:
-                p = self.spatial.find_path(r.pos, target_trap)
-                if p: return p[0]
-
-        if r.energy < 50 or r.energy >= 250:
-            if f_pos:
-                p = self.spatial.find_path(r.pos, f_pos)
-                if p: return p[0]
-
-        if self.state.crystals:
-            closest = min(self.state.crystals.keys(), key=lambda c: self.spatial.manhattan_distance(r.pos, c))
-            p = self.spatial.find_path(r.pos, closest)
-            if p: return p[0]
+        # P3: Economic Budgeting
+        if r.energy > 1000 and r.build_cd == 0:
+            counts = {t: sum(1 for rob in self.state.my_robots.values() if rob.rtype == t) for t in [1, 2, 3]}
+            if counts[3] < 3 and r.energy > 1500: return "BUILD_MINER"
+            if counts[2] < 4 and r.energy > 1200: return "BUILD_WORKER"
+            if counts[1] < 6: return "BUILD_SCOUT"
             
+        return ACTION_NORTH if self.state.step % 10 == 0 else ACTION_IDLE
+
+    def _energy_dump(self, r: RobotData, f: Optional[RobotData]) -> Optional[str]:
+        if not f: return None
+        if self.nav.manhattan_distance(r.pos, f.pos) == 1:
+            w = self.state.walls.get(r.pos, 0)
+            if f.row > r.row and not (w & 1): return "TRANSFER_NORTH"
+            if f.row < r.row and not (w & 4): return "TRANSFER_SOUTH"
+            if f.col > r.col and not (w & 2): return "TRANSFER_EAST"
+            if f.col < r.col and not (w & 8): return "TRANSFER_WEST"
+        return None
+
+    def _scout_logic(self, r: RobotData, f: Optional[RobotData]) -> str:
+        dump = self._energy_dump(r, f)
+        if dump: return dump
+        if r.energy < 30 or r.energy > 80:
+            if f:
+                p = self.nav.find_path(r.pos, f.pos)
+                if p: return p[0]
+        if self.state.crystals:
+            targets = sorted(self.state.crystals.items(), key=lambda x: -x[1]/(self.nav.manhattan_distance(r.pos, x[0])+1))
+            p = self.nav.find_path(r.pos, targets[0][0])
+            if p: return p[0]
+        return self.nav.find_path(r.pos, (r.col, min(r.row + 5, 500)))[0] if self.nav.find_path(r.pos, (r.col, min(r.row + 5, 500))) else ACTION_NORTH
+
+    def _worker_logic(self, r: RobotData, f: Optional[RobotData]) -> str:
+        dump = self._energy_dump(r, f)
+        if dump: return dump
+        
+        # Tactical Bottlenecking
+        for en in self.state.enemy_robots.values():
+            if en.rtype == TYPE_FACTORY and self.nav.manhattan_distance(r.pos, en.pos) < 3:
+                if r.energy > 100: return "BUILD_NORTH"
+        
+        if r.energy < 50 or r.energy > 250:
+            if f:
+                p = self.nav.find_path(r.pos, f.pos)
+                if p: return p[0]
+        if self.state.crystals:
+            closest = min(self.state.crystals.keys(), key=lambda c: self.nav.manhattan_distance(r.pos, c))
+            p = self.nav.find_path(r.pos, closest)
+            if p: return p[0]
         return ACTION_NORTH
 
-    def _decide_miner(self, r: RobotData) -> str:
-        if r.pos in self.state.mining_nodes and r.energy >= self.state.config.transformCost:
-            return "TRANSFORM"
-        
-        # Filter nodes that already have mines
-        available_nodes = [n for n in self.state.persistent_mining_nodes if n not in self.state.mines]
-        
-        if available_nodes:
-            closest = min(available_nodes, key=lambda n: self.spatial.manhattan_distance(r.pos, n))
-            p = self.spatial.find_path(r.pos, closest)
+    def _miner_logic(self, r: RobotData) -> str:
+        if r.pos in self.state.persistent_mining_nodes and r.energy >= 100: return "TRANSFORM"
+        targets = [n for n in self.state.persistent_mining_nodes if n not in self.state.mines]
+        if targets:
+            closest = min(targets, key=lambda n: self.nav.manhattan_distance(r.pos, n))
+            p = self.nav.find_path(r.pos, closest)
             if p: return p[0]
         return ACTION_NORTH
 
 # ==========================================
-# 6. KAGGLE ENVIRONMENT ENTRYPOINT
+# 6. ENTRYPOINT
 # ==========================================
-_game_state: Optional[GameState] = None
-
+_engine: Optional[GameState] = None
 def agent(obs: Any, config: Any) -> Dict[str, str]:
-    global _game_state
+    global _engine
     try:
-        if _game_state is None:
-            _game_state = GameState(config)
-            # Absolute determinism lock based on provided seed or universal constant
-            random.seed(config.randomSeed if hasattr(config, 'randomSeed') and config.randomSeed else 1337)
-            
-        _game_state.update(obs)
-        spatial = SpatialEngine(_game_state)
-        dispatcher = ActionDispatcher(_game_state, spatial)
-        return dispatcher.dispatch()
-        
-    except Exception as e:
-        logger.error(f"FATAL ERROR CAUGHT AT ROOT BOUNDARY: {e}", exc_info=True)
-        # Ultimate Fallback: Ensure Factory attempts to survive, others IDLE
+        if _engine is None:
+            _engine = GameState(config)
+            random.seed(config.randomSeed if hasattr(config, 'randomSeed') and config.randomSeed else 42)
+        _engine.update(obs)
+        nav = NavigationEngine(_engine)
+        return TacticalDispatcher(_engine, nav).dispatch()
+    except Exception:
         fallback = {}
         if obs and hasattr(obs, 'robots'):
             for uid, data in obs.robots.items():
-                if data[4] == obs.player:
-                    fallback[uid] = ACTION_NORTH if data[0] == TYPE_FACTORY else ACTION_IDLE
+                if data[4] == obs.player: fallback[uid] = ACTION_NORTH if data[0] == TYPE_FACTORY else ACTION_IDLE
         return fallback
