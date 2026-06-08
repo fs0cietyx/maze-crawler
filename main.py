@@ -323,11 +323,28 @@ class TacticalDispatcher:
 
             actions[r.uid] = chosen_act
             reserved_set.add(nxt)
-            # For actions that affect a secondary cell (BUILD/REMOVE), we don't strictly reserve the secondary cell
-            # because the robot doesn't move there, but we could if we wanted to prevent others moving into the new wall.
-            # However, the game allows building a wall even if a robot is moving into that cell.
             
         return actions
+
+    def _combat_micro(self, r: RobotData) -> Optional[str]:
+        # Priority 1: Offensive Crushing
+        for nxt, act in self.nav.get_neighbors(r.pos):
+            enemy = next((en for en in self.state.enemy_robots.values() if en.pos == nxt), None)
+            if enemy and r.power > enemy.power:
+                safe, _ = self.is_safe(r, act, set())
+                if safe: return act
+
+        # Priority 2: Tactical Kiting (Run from stronger enemies)
+        hostiles = [en for en in self.state.enemy_robots.values() if en.power > r.power and self.nav.manhattan_distance(r.pos, en.pos) <= 2]
+        if hostiles:
+            best_move = ACTION_IDLE; max_min_dist = min(self.nav.manhattan_distance(r.pos, h.pos) for h in hostiles)
+            for _, act in self.nav.get_neighbors(r.pos):
+                safe, nxt = self.is_safe(r, act, set())
+                if safe:
+                    d = min(self.nav.manhattan_distance(nxt, h.pos) for h in hostiles)
+                    if d > max_min_dist: max_min_dist = d; best_move = act
+            if best_move != ACTION_IDLE: return best_move
+        return None
 
     def _factory_logic(self, r: RobotData) -> str:
         # P1: Survival Calculation
@@ -404,19 +421,37 @@ class TacticalDispatcher:
                             if d > max_dist:
                                 max_dist = d; best_jump = j_act
                     return best_jump
+                else:
+                    # Walk away if JUMP is on cooldown
+                    best_walk = ACTION_IDLE
+                    max_dist = self.nav.manhattan_distance(r.pos, en.pos)
+                    for _, act in self.nav.get_neighbors(r.pos):
+                        safe, nxt = self.is_safe(r, act, set())
+                        if safe:
+                            d = self.nav.manhattan_distance(nxt, en.pos)
+                            if d > max_dist:
+                                max_dist = d; best_walk = act
+                    if best_walk != ACTION_IDLE: return best_walk
 
-        # P3: Economic Budgeting (Dynamic Scaling)
-        min_energy = 400 + len(self.state.my_robots) * 50
-        if r.energy > min_energy and r.build_cd == 0:
-            counts = {t: sum(1 for rob in self.state.my_robots.values() if rob.rtype == t) for t in [1, 2, 3]}
-            # Aggressive expansion
-            max_miners = 4 if r.energy > 600 else 2
-            max_workers = 5 if r.energy > 700 else 3
-            max_scouts = 6 if r.energy > 500 else 4
+        # P3: Economic Budgeting (Strict Early-Game Build Order)
+        counts = {t: sum(1 for rob in self.state.my_robots.values() if rob.rtype == t) for t in [1, 2, 3]}
+        if r.build_cd == 0:
+            # Phase 1: Core Trifecta (Scout -> Worker -> Miner)
+            if counts[1] == 0 and r.energy >= 200: return "BUILD_SCOUT"
+            if counts[2] == 0 and r.energy >= 350: return "BUILD_WORKER"
+            if counts[3] == 0 and r.energy >= 450: return "BUILD_MINER"
             
-            if counts[3] < max_miners and r.energy > 400: return "BUILD_MINER"
-            if counts[2] < max_workers and r.energy > 400: return "BUILD_WORKER"
-            if counts[1] < max_scouts and r.energy > 200: return "BUILD_SCOUT"
+            # Phase 2: Dynamic Scaling
+            min_energy = min(800, 400 + len(self.state.my_robots) * 50)
+            if r.energy > min_energy:
+                # Aggressive expansion
+                max_miners = 4 if r.energy > 600 else 2
+                max_workers = 5 if r.energy > 700 else 3
+                max_scouts = 6 if r.energy > 500 else 4
+                
+                if counts[3] < max_miners and r.energy > 400: return "BUILD_MINER"
+                if counts[2] < max_workers and r.energy > 400: return "BUILD_WORKER"
+                if counts[1] < max_scouts and r.energy > 200: return "BUILD_SCOUT"
             
         # P4: Centering Heuristic (Only if safe and not in panic)
         if death_distance >= buffer:
@@ -449,24 +484,8 @@ class TacticalDispatcher:
         dump = self._energy_dump(r, f)
         if dump: return dump
         
-        # Priority 1: Offensive Crushing
-        for nxt, act in self.nav.get_neighbors(r.pos):
-            # Is there a weaker enemy there?
-            enemy = next((en for en in self.state.enemy_robots.values() if en.pos == nxt), None)
-            if enemy and r.power > enemy.power:
-                safe, _ = self.is_safe(r, act, set())
-                if safe: return act
-
-        # Priority 2: Micro-Tactical Kiting
-        hostiles = [en for en in self.state.enemy_robots.values() if self.nav.manhattan_distance(r.pos, en.pos) <= 2]
-        if hostiles:
-            best_move = ACTION_IDLE; max_min_dist = min(self.nav.manhattan_distance(r.pos, h.pos) for h in hostiles)
-            for _, act in self.nav.get_neighbors(r.pos):
-                safe, nxt = self.is_safe(r, act, set())
-                if safe:
-                    d = min(self.nav.manhattan_distance(nxt, h.pos) for h in hostiles)
-                    if d > max_min_dist: max_min_dist = d; best_move = act
-            if best_move != ACTION_IDLE: return best_move
+        combat = self._combat_micro(r)
+        if combat: return combat
 
         # Return to base if high energy or starving
         if (r.energy > 80 or r.energy < 30) and f:
@@ -530,6 +549,9 @@ class TacticalDispatcher:
     def _worker_logic(self, r: RobotData, f: Optional[RobotData], intent: Set[Coord]) -> str:
         dump = self._energy_dump(r, f)
         if dump: return dump
+
+        combat = self._combat_micro(r)
+        if combat: return combat
         
         # Advanced: Predictive Wolf-Pack Trapping
         for uid, en in self.state.enemy_robots.items():
@@ -587,6 +609,9 @@ class TacticalDispatcher:
         return p[0] if p else ACTION_NORTH
 
     def _miner_logic(self, r: RobotData, intent: Set[Coord]) -> str:
+        combat = self._combat_micro(r)
+        if combat: return combat
+
         # P1: Transform if on node (and it's not already our mine)
         is_our_mine = r.pos in self.state.mines and self.state.mines[r.pos][2] == self.state.player
         if r.pos in self.state.persistent_mining_nodes and not is_our_mine and r.energy >= 100: 
