@@ -5,9 +5,16 @@ from kaggle_environments import make
 
 def run_single_game(seed):
     try:
-        env = make("crawl", debug=False, configuration={"randomSeed": seed})
-        # Run against random
-        env.run(["../main.py", "random"])
+        # Extreme Hardcore Configuration: Max Speed, Extreme Starvation
+        env = make("crawl", debug=False, configuration={
+            "randomSeed": seed,
+            "scrollStartInterval": 5,
+            "scrollEndInterval": 1,
+            "crystalDensity": 0.02,
+            "miningNodeDensity": 0.01
+        })
+        # Run against ITSELF (Self-Play) to maximize CPU load and unit counts
+        env.run(["../main.py", "../main.py"])
         
         final_state = env.steps[-1]
         p1_reward = final_state[0].reward
@@ -16,7 +23,7 @@ def run_single_game(seed):
         
         result = "VICTORY" if p1_reward > p2_reward else "DEFEAT" if p1_reward < p2_reward else "DRAW"
         
-        if result == "DEFEAT":
+        if result == "DEFEAT" or p1_status != "DONE":
             replay_file = f"failure_seed_{seed}.json"
             with open(replay_file, "w") as f:
                 json.dump(env.toJSON(), f)
