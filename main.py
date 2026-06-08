@@ -89,7 +89,7 @@ class GameState:
         
         # Calculate Risk Matrix (Vectorized)
         rows = np.arange(self.south_bound, self.north_bound + 1)
-        buffer = 12 + (self.step // 60)
+        buffer = 12 + (self.step // 40)
         risk_penalties = np.maximum(0, buffer - (rows - self.south_bound)) ** 2
         # Ensure we don't exceed matrix bounds (though 1000 is usually safe)
         valid_rows = rows[rows < 1000]
@@ -105,6 +105,13 @@ class GameState:
                     for c in range(c_min, c_max):
                         dist = abs(r - en.row) + abs(c - en.col)
                         if dist <= 3: self.risk_matrix[r, c] += (4 - dist) * 15
+            else:
+                # Add localized risk for other enemy units to route our swarm around them
+                r_min, r_max = max(0, en.row - 1), min(999, en.row + 2)
+                c_min, c_max = max(0, en.col - 1), min(self.width, en.col + 2)
+                for r in range(r_min, r_max):
+                    for c in range(c_min, c_max):
+                        self.risk_matrix[r, c] += en.power * 5
 
         self.enemy_history = current_enemies
         self.path_cache.clear()
@@ -147,7 +154,7 @@ class NavigationEngine:
             
         if not (w & NORTH) and r + 1 <= self.state.north_bound: neighbors.append(((c, r + 1), ACTION_NORTH))
         if not (w & EAST) and c + 1 < self.state.width: neighbors.append(((c + 1, r), ACTION_EAST))
-        if not (w & SOUTH) and r - 1 > self.state.south_bound: neighbors.append(((c, r - 1), ACTION_SOUTH))
+        if not (w & SOUTH) and r - 1 >= self.state.south_bound: neighbors.append(((c, r - 1), ACTION_SOUTH))
         if not (w & WEST) and c - 1 >= 0: neighbors.append(((c - 1, r), ACTION_WEST))
         return neighbors
 
@@ -159,33 +166,58 @@ class NavigationEngine:
         cache_key = (start, goal)
         if not optimistic and cache_key in self.state.path_cache: return self.state.path_cache[cache_key]
 
+        # Dynamic Compute Scaling: Scale search depth based on banked time
+        time_factor = max(0.2, min(1.5, self.state.remaining_time / 40.0))
+        actual_limit = int(limit * time_factor)
+
         frontier = [(0, start)]
         came_from = {start: None}; actions = {start: None}; cost_so_far = {start: 0}
         evaluated = 0
+        
+        best_node = start
+        best_dist = self.manhattan_distance(start, goal)
 
         while frontier:
-            if evaluated > limit: break
+            if evaluated > actual_limit: break
             _, curr = heapq.heappop(frontier)
             evaluated += 1
+            
+            # Inline Manhattan for speed tracking best node
+            d = abs(curr[0] - goal[0]) + abs(curr[1] - goal[1])
+            if d < best_dist:
+                best_dist = d
+                best_node = curr
+
             if curr == goal: break
 
-            for nxt, act in self.get_neighbors(curr, optimistic):
-                # O(1) Vectorized Risk Lookup
-                risk_penalty = self.state.risk_matrix[nxt[1], nxt[0]] if self.state.step > 50 else 0
-                
-                new_cost = cost_so_far[curr] + 1 + risk_penalty
-                if nxt not in cost_so_far or new_cost < cost_so_far[nxt]:
-                    cost_so_far[nxt] = new_cost
-                    priority = new_cost + self.manhattan_distance(goal, nxt)
-                    heapq.heappush(frontier, (priority, nxt))
-                    came_from[nxt] = curr; actions[nxt] = act
+            c, r = curr
+            w = self.state.walls.get(curr, -1)
+            if w == -1:
+                if not optimistic: continue
+                w = 0
+            
+            # Inlined neighbor generation and cost calculation
+            for bit, dc, dr, act, m_cost in [(1, 0, 1, ACTION_NORTH, 1), (2, 1, 0, ACTION_EAST, 5), (4, 0, -1, ACTION_SOUTH, 100), (8, -1, 0, ACTION_WEST, 5)]:
+                if not (w & bit):
+                    nc, nr = c + dc, r + dr
+                    if 0 <= nc < self.state.width and self.state.south_bound <= nr <= self.state.north_bound:
+                        nxt = (nc, nr)
+                        risk_penalty = self.state.risk_matrix[nr, nc] if nr < 1000 else 0
+                        new_cost = cost_so_far[curr] + m_cost + risk_penalty
+                        if nxt not in cost_so_far or new_cost < cost_so_far[nxt]:
+                            cost_so_far[nxt] = new_cost
+                            priority = new_cost + abs(goal[0] - nc) + abs(goal[1] - nr)
+                            heapq.heappush(frontier, (priority, nxt))
+                            came_from[nxt] = curr; actions[nxt] = act
 
-        if goal not in came_from: return None
-        path, c = [], goal
+        target_node = goal if goal in came_from else best_node
+        if target_node == start: return None
+        
+        path, c = [], target_node
         while c != start:
             path.append(actions[c]); c = came_from[c]
         path.reverse()
-        if not optimistic: self.state.path_cache[cache_key] = path
+        if not optimistic and target_node == goal: self.state.path_cache[cache_key] = path
         return path
 
 # ==========================================
@@ -210,7 +242,7 @@ class TacticalDispatcher:
             elif "WEST" in action: nxt = (c - 2, r)
 
         # 1. Boundary & Out-of-Bounds (CRITICAL)
-        if nxt[1] <= self.state.south_bound or nxt[1] > self.state.north_bound: return False, robot.pos
+        if nxt[1] < self.state.south_bound or nxt[1] > self.state.north_bound: return False, robot.pos
         if nxt[0] < 0 or nxt[0] >= self.state.width: return False, robot.pos
         
         # 2. Wall Check (Only for simple movement)
@@ -224,9 +256,9 @@ class TacticalDispatcher:
         # 3. Collision Matrix Check
         if nxt in reserved: return False, robot.pos
             
-        # 4. Enemy Crush Logic
-        for en in self.state.enemy_robots.values():
-            if en.pos == nxt and robot.power <= en.power: return False, robot.pos
+        # 4. Predictive Enemy Crush Logic (O(1) Set Lookup)
+        if nxt in self.danger_zones.get(robot.power, set()):
+            return False, robot.pos
 
         return True, nxt
 
@@ -234,6 +266,16 @@ class TacticalDispatcher:
         actions = {}
         reserved_set: Set[Coord] = set()
         intent_reserved: Set[Coord] = set()
+        
+        # Pre-calculate predictive danger zones per power level (O(N_enemies) once)
+        self.danger_zones: Dict[int, Set[Coord]] = {1: set(), 2: set(), 3: set(), 4: set()}
+        for en in self.state.enemy_robots.values():
+            for p in range(1, en.power + 1):
+                self.danger_zones[p].add(en.pos)
+                if en.move_cd == 0:
+                    self.danger_zones[p].update([(en.col, en.row+1), (en.col, en.row-1), (en.col+1, en.row), (en.col-1, en.row)])
+                if en.rtype == TYPE_FACTORY and en.jump_cd == 0:
+                    self.danger_zones[p].update([(en.col, en.row+2), (en.col, en.row-2), (en.col+2, en.row), (en.col-2, en.row)])
         
         # Priority: Factory > Miner > Worker > Scout
         robots = sorted(self.state.my_robots.values(), key=lambda x: -x.power)
@@ -251,16 +293,26 @@ class TacticalDispatcher:
             safe, nxt = self.is_safe(r, chosen_act, reserved_set)
             if not safe:
                 # Forced Survival/Evasion
+                death_dist = r.row - self.state.south_bound
+                # Priority: NORTH > Lateral > IDLE > SOUTH
+                sort_order = {ACTION_NORTH: 0, ACTION_EAST: 1, ACTION_WEST: 1, ACTION_IDLE: 2, ACTION_SOUTH: 3}
+
+                # Filter out SOUTH if dangerously close to boundary
+                candidates = self.nav.get_neighbors(r.pos)
+                if death_dist < 5:
+                    candidates = [c for c in candidates if c[1] != ACTION_SOUTH]
+
                 found = False
-                # Try all directions (prioritize NORTH)
-                for _, act in sorted(self.nav.get_neighbors(r.pos), key=lambda x: 0 if x[1]==ACTION_NORTH else 1):
+                for _, act in sorted(candidates, key=lambda x: sort_order.get(x[1], 4)):
                     s, n = self.is_safe(r, act, reserved_set)
                     if s:
                         chosen_act = act; nxt = n; found = True
                         break
-                
+
                 if not found:
-                    # If even neighbors are blocked, try IDLE ONLY if it's boundary-safe
+                    # Absolute last resort: try IDLE even if marked unsafe
+                    chosen_act = ACTION_IDLE; nxt = r.pos
+
                     s, n = self.is_safe(r, ACTION_IDLE, reserved_set)
                     if s:
                         chosen_act = ACTION_IDLE; nxt = n; found = True
@@ -280,30 +332,59 @@ class TacticalDispatcher:
     def _factory_logic(self, r: RobotData) -> str:
         # P1: Survival Calculation
         death_distance = r.row - self.state.south_bound
-        buffer = 10 + (self.state.step // 50)
+        buffer = 12 + (self.state.step // 40)
         
         if death_distance < buffer:
             # Urgent Northward Movement
             if r.jump_cd == 0:
-                for target_row in [r.row + 2, r.row + 1]:
-                    if target_row <= self.state.north_bound:
-                        for dc in [0, 1, -1, 2, -2]:
-                            tc = r.col + dc
-                            if 0 <= tc < self.state.width:
-                                if target_row == r.row + 2: act = f"JUMP_{'NORTH' if dc==0 else 'EAST' if dc>0 else 'WEST'}"
-                                else: act = ACTION_NORTH
-                                # Verify safety
-                                s, _ = self.is_safe(r, act, set())
-                                if s: return act
+                # Prioritize pure North jump, then lateral jumps
+                for dc, dr, act in [(0, 2, "JUMP_NORTH"), (2, 0, "JUMP_EAST"), (-2, 0, "JUMP_WEST")]:
+                    target_row = r.row + dr
+                    tc = r.col + dc
+                    if 0 <= tc < self.state.width and target_row <= self.state.north_bound:
+                        safe, _ = self.is_safe(r, act, set())
+                        if safe: return act
+                # Try simple North
+                safe, _ = self.is_safe(r, ACTION_NORTH, set())
+                if safe: return ACTION_NORTH
             
-            # Use pathfinding to find a northern escape
-            for target_row in range(min(r.row + 10, self.state.north_bound), r.row, -1):
-                for dc in [0, 1, -1, 2, -2]:
-                    target_pos = (max(0, min(self.state.width - 1, r.col + dc)), target_row)
-                    path = self.nav.find_path(r.pos, target_pos, limit=200)
-                    if path: return path[0]
+            # Robust Pathfinding for Escape
+            escape_targets = []
+            for tr in [r.row + 10, r.row + 5]:
+                for tc in [r.col, self.state.width // 2, 0, self.state.width - 1]:
+                    target = (max(0, min(self.state.width - 1, tc)), min(self.state.north_bound, tr))
+                    if target[1] > r.row: escape_targets.append(target)
             
-            return ACTION_NORTH
+            for target in escape_targets:
+                path = self.nav.find_path(r.pos, target, limit=1000)
+                if path and path[0] != ACTION_SOUTH: return path[0]
+            
+            # Emergency Wall Breaker (Build Worker if trapped)
+            if r.energy >= 200 and r.build_cd == 0:
+                # If we are trapped (ActionNorth is not safe), build a Worker
+                safe_north, _ = self.is_safe(r, ACTION_NORTH, set())
+                if not safe_north:
+                    return "BUILD_WORKER"
+            
+            # Panic Fallback: Best Greedy Safe Move (Prohibit SOUTH)
+            best_panic = ACTION_NORTH
+            max_row = -1
+            for _, act in self.nav.get_neighbors(r.pos):
+                if act == ACTION_SOUTH: continue # NEVER south in panic
+                safe, nxt = self.is_safe(r, act, set())
+                if safe and nxt[1] > max_row:
+                    max_row = nxt[1]; best_panic = act
+            return best_panic
+
+        # P1.5: Offensive Crushing (Prohibit SOUTH)
+        if r.jump_cd == 0:
+            for j_pos, j_act in [((r.col, r.row+2), "JUMP_NORTH"), 
+                                 ((r.col+2, r.row), "JUMP_EAST"), ((r.col-2, r.row), "JUMP_WEST")]:
+                if 0 <= j_pos[0] < self.state.width and self.state.south_bound < j_pos[1] <= self.state.north_bound:
+                    enemy = next((en for en in self.state.enemy_robots.values() if en.pos == j_pos), None)
+                    if enemy and r.power > enemy.power:
+                        safe, _ = self.is_safe(r, j_act, set())
+                        if safe: return j_act
 
         # P2: Adversarial Evasion
         for en in self.state.enemy_robots.values():
@@ -324,21 +405,35 @@ class TacticalDispatcher:
                                 max_dist = d; best_jump = j_act
                     return best_jump
 
-        # P3: Economic Budgeting (Strict)
-        min_energy = 500 + len(self.state.my_robots) * 50
+        # P3: Economic Budgeting (Dynamic Scaling)
+        min_energy = 400 + len(self.state.my_robots) * 50
         if r.energy > min_energy and r.build_cd == 0:
             counts = {t: sum(1 for rob in self.state.my_robots.values() if rob.rtype == t) for t in [1, 2, 3]}
-            if counts[3] < 2 and r.energy > 1200: return "BUILD_MINER"
-            if counts[2] < 3 and r.energy > 1000: return "BUILD_WORKER"
-            if counts[1] < 4 and r.energy > 600: return "BUILD_SCOUT"
+            # Aggressive expansion
+            max_miners = 4 if r.energy > 600 else 2
+            max_workers = 5 if r.energy > 700 else 3
+            max_scouts = 6 if r.energy > 500 else 4
             
-        # P4: Centering Heuristic
-        target_col = self.state.width // 2
-        if abs(r.col - target_col) > 1:
-            p = self.nav.find_path(r.pos, (target_col, r.row))
-            if p: return p[0]
+            if counts[3] < max_miners and r.energy > 400: return "BUILD_MINER"
+            if counts[2] < max_workers and r.energy > 400: return "BUILD_WORKER"
+            if counts[1] < max_scouts and r.energy > 200: return "BUILD_SCOUT"
+            
+        # P4: Centering Heuristic (Only if safe and not in panic)
+        if death_distance >= buffer:
+            target_col = self.state.width // 2
+            if abs(r.col - target_col) > 1:
+                p = self.nav.find_path(r.pos, (target_col, r.row))
+                if p: return p[0]
 
-        return ACTION_NORTH if self.state.step % 8 == 0 else ACTION_IDLE
+        # P5: Constant Progression
+        # Move North proactively using pathfinding to avoid getting stuck behind walls
+        target_pos = (r.col, min(r.row + 3, self.state.north_bound))
+        p = self.nav.find_path(r.pos, target_pos, optimistic=True)
+        if p:
+            safe, _ = self.is_safe(r, p[0], set())
+            if safe: return p[0]
+
+        return ACTION_NORTH if self.state.step % 4 == 0 else ACTION_IDLE
 
     def _energy_dump(self, r: RobotData, f: Optional[RobotData]) -> Optional[str]:
         if not f: return None
@@ -354,7 +449,15 @@ class TacticalDispatcher:
         dump = self._energy_dump(r, f)
         if dump: return dump
         
-        # Micro-Tactical Kiting
+        # Priority 1: Offensive Crushing
+        for nxt, act in self.nav.get_neighbors(r.pos):
+            # Is there a weaker enemy there?
+            enemy = next((en for en in self.state.enemy_robots.values() if en.pos == nxt), None)
+            if enemy and r.power > enemy.power:
+                safe, _ = self.is_safe(r, act, set())
+                if safe: return act
+
+        # Priority 2: Micro-Tactical Kiting
         hostiles = [en for en in self.state.enemy_robots.values() if self.nav.manhattan_distance(r.pos, en.pos) <= 2]
         if hostiles:
             best_move = ACTION_IDLE; max_min_dist = min(self.nav.manhattan_distance(r.pos, h.pos) for h in hostiles)
@@ -365,27 +468,64 @@ class TacticalDispatcher:
                     if d > max_min_dist: max_min_dist = d; best_move = act
             if best_move != ACTION_IDLE: return best_move
 
-        # Return to base if high energy
-        if r.energy > 80 and f:
-            p = self.nav.find_path(r.pos, f.pos)
-            if p: return p[0]
-
-        if r.energy < 30 and f:
-            p = self.nav.find_path(r.pos, f.pos)
-            if p: return p[0]
+        # Return to base if high energy or starving
+        if (r.energy > 80 or r.energy < 30) and f:
+            if self.nav.manhattan_distance(r.pos, f.pos) > 1:
+                p = self.nav.find_path(r.pos, f.pos)
+                if p: return p[0]
         
-        # Collection with Reservation
-        available = {pos: e for pos, e in self.state.crystals.items() if pos not in intent}
-        if available:
-            targets = sorted(available.items(), key=lambda x: -x[1]/(self.nav.manhattan_distance(r.pos, x[0])+1))
-            target_pos = targets[0][0]
-            intent.add(target_pos)
-            p = self.nav.find_path(r.pos, target_pos)
-            if p: return p[0]
+        # Collection (Crystals & Mines)
+        act = self._collection_logic(r, intent)
+        if act: return act
             
         target_pos = (r.col, min(r.row + 8, self.state.north_bound))
         p = self.nav.find_path(r.pos, target_pos, optimistic=True)
         return p[0] if p else ACTION_NORTH
+
+    def _collection_logic(self, r: RobotData, intent: Set[Coord]) -> Optional[str]:
+        # Capacity check: Don't harvest if nearly full
+        max_energy = 100 if r.rtype == 1 else 300 if r.rtype == 2 else 500
+        if r.energy > max_energy * 0.9: return None
+
+        # Priority 1: Crystals in vision
+        available = {pos: e for pos, e in self.state.crystals.items() if pos not in intent}
+        # Priority 2: Friendly Mines with energy
+        mines = {pos: data[0] for pos, data in self.state.mines.items() 
+                 if data[2] == self.state.player and data[0] > 0 and pos not in intent}
+        
+        targets = []
+        for pos, e in available.items():
+            d = self.nav.manhattan_distance(r.pos, pos)
+            targets.append((pos, e / (d * d + 1)))
+        for pos, e in mines.items():
+            d = self.nav.manhattan_distance(r.pos, pos)
+            targets.append((pos, min(e, 100) / (d * d + 1)))
+            
+        if targets:
+            targets.sort(key=lambda x: -x[1])
+            best_pos = targets[0][0]
+            intent.add(best_pos) # Reserve target
+            if r.pos == best_pos: return ACTION_IDLE # Harvest
+            p = self.nav.find_path(r.pos, best_pos)
+            if p: return p[0]
+        
+        # Priority 3: Exploration (Undiscovered cells)
+        undiscovered = []
+        # Focus exploration on NORTH and lateral areas
+        for row in range(max(self.state.south_bound + 1, r.row - 2), min(self.state.north_bound + 1, r.row + 10)):
+            for col in range(self.state.width):
+                if (col, row) not in self.state.walls and (col, row) not in intent:
+                    undiscovered.append((col, row))
+        if undiscovered:
+            # Deterministic but spread out sampling
+            undiscovered.sort(key=lambda c: self.nav.manhattan_distance(r.pos, c))
+            idx = hash(r.uid) % min(len(undiscovered), 5)
+            closest = undiscovered[min(len(undiscovered)-1, idx)] # Spread units
+            intent.add(closest)
+            p = self.nav.find_path(r.pos, closest, limit=150)
+            if p: return p[0]
+
+        return None
 
     def _worker_logic(self, r: RobotData, f: Optional[RobotData], intent: Set[Coord]) -> str:
         dump = self._energy_dump(r, f)
@@ -410,56 +550,47 @@ class TacticalDispatcher:
                             dist = self.nav.manhattan_distance(r.pos, spot)
                             if dist <= 1:
                                 intent.add(spot)
-                                # Precise Directional Building towards enemy from trap spot
                                 if r.pos == spot:
                                     if r.row == pred_pos[1]+1: return "BUILD_SOUTH"
                                     if r.row == pred_pos[1]-1: return "BUILD_NORTH"
                                     if r.col == pred_pos[0]+1: return "BUILD_WEST"
                                     if r.col == pred_pos[0]-1: return "BUILD_EAST"
                                     return "BUILD_NORTH"
-                                # Build from adjacent to trap spot
-                                if r.row == spot[1]-1 and r.col == spot[0]: return "BUILD_NORTH"
-                                if r.row == spot[1]+1 and r.col == spot[0]: return "BUILD_SOUTH"
-                                if r.col == spot[0]-1 and r.row == spot[1]: return "BUILD_EAST"
-                                if r.col == spot[0]+1 and r.row == spot[1]: return "BUILD_WEST"
                             elif dist <= 5:
-                                # Path to trap spot
                                 intent.add(spot)
                                 p = self.nav.find_path(r.pos, spot)
                                 if p: return p[0]
 
-        # Return to base if high energy
-        if r.energy > 250 and f:
-            p = self.nav.find_path(r.pos, f.pos)
-            if p: return p[0]
+        # Return to base if high energy or starving
+        if (r.energy > 250 or r.energy < 60) and f:
+            if self.nav.manhattan_distance(r.pos, f.pos) > 1:
+                p = self.nav.find_path(r.pos, f.pos)
+                if p: return p[0]
         
         # Shortcut / Wall Removal Logic
         if r.energy > 150:
             for dr, dc, act in [(1,0,"REMOVE_NORTH"), (-1,0,"REMOVE_SOUTH"), (0,1,"REMOVE_EAST"), (0,-1,"REMOVE_WEST")]:
                 target_pos = (r.col + dc, r.row + dr)
-                if target_pos in self.state.crystals or (f and self.nav.manhattan_distance(target_pos, f.pos) < self.nav.manhattan_distance(r.pos, f.pos)):
+                # Aggressive Path-Clearing for Factory
+                is_factory_path = f and f.col == target_pos[0] and target_pos[1] > f.row and target_pos[1] <= f.row + 3
+                if is_factory_path or target_pos in self.state.crystals or (f and self.nav.manhattan_distance(target_pos, f.pos) < self.nav.manhattan_distance(r.pos, f.pos)):
                     w = self.state.walls.get(r.pos, 0)
                     bit = { "NORTH":1, "EAST":2, "SOUTH":4, "WEST":8 }[act.split("_")[1]]
                     if (w & bit): return act
 
-        if r.energy < 60 and f:
-            p = self.nav.find_path(r.pos, f.pos)
-            if p: return p[0]
-
-        available = {pos: e for pos, e in self.state.crystals.items() if pos not in intent}
-        if available:
-            closest = min(available.keys(), key=lambda c: self.nav.manhattan_distance(r.pos, c))
-            intent.add(closest)
-            p = self.nav.find_path(r.pos, closest)
-            if p: return p[0]
+        # Collection (Crystals & Mines)
+        act = self._collection_logic(r, intent)
+        if act: return act
         
         target_pos = (r.col, min(r.row + 3, self.state.north_bound))
         p = self.nav.find_path(r.pos, target_pos, optimistic=True)
         return p[0] if p else ACTION_NORTH
 
     def _miner_logic(self, r: RobotData, intent: Set[Coord]) -> str:
-        # P1: Transform if on node
-        if r.pos in self.state.persistent_mining_nodes and r.energy >= 100: return "TRANSFORM"
+        # P1: Transform if on node (and it's not already our mine)
+        is_our_mine = r.pos in self.state.mines and self.state.mines[r.pos][2] == self.state.player
+        if r.pos in self.state.persistent_mining_nodes and not is_our_mine and r.energy >= 100: 
+            return "TRANSFORM"
         
         # P2: Seek untransformed nodes with reservation
         targets = [n for n in self.state.persistent_mining_nodes if n not in self.state.mines and n not in intent]
@@ -469,8 +600,20 @@ class TacticalDispatcher:
             p = self.nav.find_path(r.pos, closest)
             if p: return p[0]
             
-        # P3: Stay near factory if no nodes
+        # P3: Harvest existing mines or return energy
         factory = next((rob for rob in self.state.my_robots.values() if rob.rtype == TYPE_FACTORY), None)
+        if r.energy > 400 and factory:
+            if self.nav.manhattan_distance(r.pos, factory.pos) > 1:
+                p = self.nav.find_path(r.pos, factory.pos)
+                if p: return p[0]
+            else:
+                dump = self._energy_dump(r, factory)
+                if dump: return dump
+            
+        act = self._collection_logic(r, intent)
+        if act: return act
+
+        # P4: Stay near factory if no nodes
         if factory and self.nav.manhattan_distance(r.pos, factory.pos) > 3:
             p = self.nav.find_path(r.pos, factory.pos)
             if p: return p[0]
